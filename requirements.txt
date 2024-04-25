@@ -1,0 +1,4 @@
+openai
+dbus-python
+PyGObject
+regex
