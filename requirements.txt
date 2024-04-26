@@ -2,3 +2,4 @@ openai
 dbus-python
 PyGObject
 regex
+requests

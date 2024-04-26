@@ -2,10 +2,10 @@ import re
 import os
 import time
 
-import openai
-from typing import List, Dict, Callable, Tuple
+import requests
+from typing import List, Callable, Tuple
 
-SAKURA_API_BASE = os.getenv('SAKURA_API_BASE', 'http://127.0.0.1:8080/v1/')  # SAKURA API地址
+SAKURA_API_BASE = os.getenv('SAKURA_API_BASE', 'http://127.0.0.1:8080/')  # SAKURA API地址
 SAKURA_VERSION = os.getenv('SAKURA_VERSION', '0.9')  # SAKURA API版本，可选值：0.9、0.10，选择0.10则会加载术语表。
 SAKURA_DICT_PATH = os.getenv('SAKURA_DICT_PATH', './sakura_dict.txt')  # SAKURA 术语表路径
 
@@ -219,14 +219,9 @@ class SakuraTranslator():
     def __init__(self):
         super().__init__()
         self.logger = logging.getLogger("SakuraTranslator")
-        if "/v1/" not in SAKURA_API_BASE:
-            openai.base_url = SAKURA_API_BASE + "/v1/"
-        else:
-            openai.base_url = SAKURA_API_BASE
-        openai.api_key = "sk-114514"
-        self.temperature = 0.3
+        self.temperature = 0.1
         self.top_p = 0.3
-        self.frequency_penalty = 0.1
+        self.frequency_penalty = 0.05
         self._current_style = "precise"
         self._emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]')
         self._heart_pattern = re.compile(r'❤')
@@ -398,8 +393,13 @@ class SakuraTranslator():
             response = _retry_translation(queries, lambda r: not self._check_align(queries, r),
                                           '因为检测到原文与译文行数不匹配，重新翻译。')
             if response is None:
-                self.logger.warning(f'原文与译文行数不匹配，尝试{self._RETRY_ATTEMPTS}次仍未解决，进行单行翻译。')
-                return self._translate_single_lines(queries)
+                self.logger.warning(f'原文与译文行数不匹配，尝试{self._RETRY_ATTEMPTS}次仍未解决，切半后重新尝试。')
+                mid = len(queries) // 2
+                first_half = self._check_translation_quality(queries[:mid],
+                                                             self._handle_translation_request(queries[:mid]))
+                second_half = self._check_translation_quality(queries[mid:],
+                                                              self._handle_translation_request(queries[mid:]))
+                return first_half + second_half
 
         return self._split_text(response)
 
@@ -491,30 +491,30 @@ class SakuraTranslator():
         """
         处理翻译请求,包括错误处理和重试逻辑。
         """
-        ratelimit_attempt = 0
-        server_error_attempt = 0
-        timeout_attempt = 0
+        retry_attempt = 0
         while True:
             try:
                 response = self._request_translation(prompt)
                 break
-            except openai.error.Timeout:
-                timeout_attempt += 1
-                if timeout_attempt >= self._TIMEOUT_RETRY_ATTEMPTS:
+            except requests.exceptions.Timeout:
+                retry_attempt += 1
+                if retry_attempt >= self._TIMEOUT_RETRY_ATTEMPTS:
                     raise Exception('Sakura超时。')
-                self.logger.warning(f'Sakura因超时而进行重试。尝试次数： {timeout_attempt}')
-            except openai.RateLimitError:
-                ratelimit_attempt += 1
-                if ratelimit_attempt >= self._RATELIMIT_RETRY_ATTEMPTS:
-                    raise
-                self.logger.warning(f'Sakura因被限速而进行重试。尝试次数： {ratelimit_attempt}')
-                time.sleep(2)
-            except (openai.APIError, openai.APIConnectionError) as e:
-                server_error_attempt += 1
-                if server_error_attempt >= self._RETRY_ATTEMPTS:
-                    self.logger.error(f'Sakura API请求失败。错误信息： {e}')
-                    return prompt
-                self.logger.warning(f'Sakura因服务器错误而进行重试。尝试次数： {server_error_attempt}，错误信息： {e}')
+                self.logger.warning(f'Sakura因超时而进行重试。尝试次数： {retry_attempt}')
+            except requests.exceptions.RequestException as e:
+                if e.response is not None and e.response.status_code == 429:  # Rate limited
+                    retry_attempt += 1
+                    if retry_attempt >= self._RATELIMIT_RETRY_ATTEMPTS:
+                        raise Exception('Sakura因被限速而无法继续。')
+                    self.logger.warning(f'Sakura因被限速而进行重试。尝试次数： {retry_attempt}')
+                    time.sleep(2)  # Wait for 2 seconds before retrying
+                else:
+                    retry_attempt += 1
+                    if retry_attempt >= self._RETRY_ATTEMPTS:
+                        self.logger.error(f'Sakura API请求失败。错误信息： {e}')
+                        return prompt
+                    self.logger.warning(f'Sakura因服务器错误而进行重试。尝试次数： {retry_attempt}，错误信息： {e}')
+                    time.sleep(2)
 
         return response
 
@@ -529,11 +529,6 @@ class SakuraTranslator():
         raw_lenth = len(raw_text)
         max_lenth = 512
         max_token_num = max(raw_lenth * 2, max_lenth)
-        extra_query = {
-            'do_sample': False,
-            'num_beams': 1,
-            'repetition_penalty': 1.0,
-        }
         if SAKURA_VERSION == "0.9":
             messages = [
                 {
@@ -558,22 +553,26 @@ class SakuraTranslator():
                     "content": f"根据以下术语表：\n{gpt_dict_raw_text}\n将下面的日文文本根据上述术语表的对应关系和注释翻译成中文：{raw_text}"
                 }
             ]
-        response = openai.chat.completions.create(
-            model="sukinishiro",
-            messages=messages,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            max_tokens=max_token_num,
-            frequency_penalty=self.frequency_penalty,
-            seed=-1,
-            extra_query=extra_query,
-        )
-        # 提取并返回响应文本
-        for choice in response.choices:
-            if 'text' in choice:
-                return choice.text
+        data = {
+            "prompt": "".join(
+                f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n<|im_start|>assistant\n" for message in
+                messages),
+            "n_predict": max_token_num,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": 40,
+            "repeat_penalty": 1,
+            "frequency_penalty": 0
+        }
 
-        return response.choices[0].message.content
+        # 提取并返回响应文本
+        response = requests.post(f"{SAKURA_API_BASE}completion", json=data, headers={
+            "Content-Type": "application/json"
+        })
+        response.raise_for_status()
+
+        resp_data = response.json()
+        return resp_data['content']
 
     def _set_gpt_style(self, style_name: str):
         """
